@@ -1,0 +1,39 @@
+from pathlib import Path
+from IPython.display import display
+from PIL import Image
+
+# Caminho correto para a pasta que contém as imagens de teste
+pasta_teste = Path("/content/sample_data/cachorros")
+extensoes_imagem = {".jpg", ".jpeg", ".png", ".bmp"}
+
+if not pasta_teste.exists():
+    print(f"A pasta não foi encontrada: {pasta_teste}")
+else:
+    fotos = [
+        arquivo for arquivo in pasta_teste.iterdir()
+        if arquivo.is_file() and arquivo.suffix.lower() in extensoes_imagem
+    ]
+
+    if not fotos:
+        print("Não encontrei imagens nessa pasta.")
+    else:
+        print(f"Encontrei {len(fotos)} imagem(ns).")
+
+        for foto in fotos:
+            resultados = modelo.predict(
+                source=str(foto),
+                conf=0.25,
+                verbose=False
+            )
+
+            # Verificação para evitar IndexError caso a imagem falhe ao ser carregada
+            if resultados:
+                imagem_anotada = resultados[0].plot()
+
+                # Converte as cores para exibição correta no Colab (BGR para RGB)
+                imagem_anotada = imagem_anotada[:, :, ::-1]
+
+                print(f"Resultado: {foto.name}")
+                display(Image.fromarray(imagem_anotada))
+            else:
+                print(f"Erro ao processar ou ler a imagem: {foto.name}")
