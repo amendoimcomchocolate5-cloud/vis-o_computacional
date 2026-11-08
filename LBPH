@@ -1,1 +1,218 @@
+from pathlib import Path
+import argparse
+import json
 
+import cv2
+import numpy as np
+
+
+TAMANHO_ROSTO = (200, 200)
+EXTENSOES = {".jpg", ".jpeg", ".png", ".bmp"}
+
+
+def criar_detector():
+    caminho = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+    detector = cv2.CascadeClassifier(caminho)
+
+    if detector.empty():
+        raise RuntimeError("Não foi possível carregar o detector de rostos.")
+
+    return detector
+
+
+def localizar_rostos(imagem, detector):
+    cinza = cv2.cvtColor(imagem, cv2.COLOR_BGR2GRAY)
+    rostos = detector.detectMultiScale(
+        cinza,
+        scaleFactor=1.1,
+        minNeighbors=5,
+        minSize=(40, 40),
+    )
+    return cinza, rostos
+
+
+def treinar(pasta_dados, arquivo_modelo, arquivo_nomes):
+    detector = criar_detector()
+    imagens_treino = []
+    identificadores = []
+    nomes = {}
+
+    pastas_pessoas = sorted(p for p in pasta_dados.iterdir() if p.is_dir())
+
+    if not pastas_pessoas:
+        raise RuntimeError(f"Nenhuma pasta de pessoa encontrada em: {pasta_dados}")
+
+    for identificador, pasta_pessoa in enumerate(pastas_pessoas):
+        nomes[str(identificador)] = pasta_pessoa.name
+        total_pessoa = 0
+
+        for caminho_imagem in pasta_pessoa.rglob("*"):
+            if caminho_imagem.suffix.lower() not in EXTENSOES:
+                continue
+
+            imagem = cv2.imread(str(caminho_imagem))
+            if imagem is None:
+                print(f"Aviso: não consegui abrir {caminho_imagem}")
+                continue
+
+            cinza, rostos = localizar_rostos(imagem, detector)
+
+            if len(rostos) == 0:
+                print(f"Aviso: nenhum rosto encontrado em {caminho_imagem}")
+                continue
+
+            # Usa o maior rosto encontrado na foto.
+            x, y, largura, altura = max(
+                rostos, key=lambda caixa: caixa[2] * caixa[3]
+            )
+            recorte = cinza[y:y + altura, x:x + largura]
+            recorte = cv2.resize(recorte, TAMANHO_ROSTO)
+
+            imagens_treino.append(recorte)
+            identificadores.append(identificador)
+            total_pessoa += 1
+
+        print(f"{pasta_pessoa.name}: {total_pessoa} foto(s) aproveitada(s)")
+
+    if not imagens_treino:
+        raise RuntimeError(
+            "Não encontrei rostos para treinar. Confira as fotos e as pastas."
+        )
+
+    reconhecedor = cv2.face.LBPHFaceRecognizer_create()
+    reconhecedor.train(imagens_treino, np.array(identificadores))
+    reconhecedor.write(str(arquivo_modelo))
+
+    arquivo_nomes.write_text(
+        json.dumps(nomes, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    print(f"Modelo salvo em: {arquivo_modelo}")
+    print(f"Lista de pessoas salva em: {arquivo_nomes}")
+
+
+def reconhecer(entrada, saida, arquivo_modelo, arquivo_nomes, limite):
+    detector = criar_detector()
+
+    reconhecedor = cv2.face.LBPHFaceRecognizer_create()
+    reconhecedor.read(str(arquivo_modelo))
+
+    nomes = json.loads(arquivo_nomes.read_text(encoding="utf-8"))
+
+    def processar_quadro(quadro):
+        resultado = quadro.copy()
+        cinza, rostos = localizar_rostos(quadro, detector)
+
+        for (x, y, largura, altura) in rostos:
+            recorte = cinza[y:y + altura, x:x + largura]
+            recorte = cv2.resize(recorte, TAMANHO_ROSTO)
+
+            identificador, distancia = reconhecedor.predict(recorte)
+
+            if identificador != -1 and distancia <= limite:
+                nome = nomes.get(str(identificador), "Pessoa desconhecida")
+                texto = f"{nome} (distancia: {distancia:.1f})"
+                cor = (0, 200, 0)
+            else:
+                texto = f"Desconhecido (distancia: {distancia:.1f})"
+                cor = (0, 0, 255)
+
+            cv2.rectangle(resultado, (x, y), (x + largura, y + altura), cor, 2)
+            cv2.putText(
+                resultado,
+                texto,
+                (x, max(y - 10, 20)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                cor,
+                2,
+            )
+
+        return resultado
+
+    # Primeiro tenta abrir a entrada como imagem.
+    imagem = cv2.imread(str(entrada))
+    if imagem is not None:
+        resultado = processar_quadro(imagem)
+        if not cv2.imwrite(str(saida), resultado):
+            raise RuntimeError(f"Não consegui salvar a imagem em: {saida}")
+        print(f"Imagem processada e salva em: {saida}")
+        return
+
+    # Se não for imagem, tenta abrir como vídeo.
+    captura = cv2.VideoCapture(str(entrada))
+    if not captura.isOpened():
+        raise RuntimeError(f"Não consegui abrir a imagem ou o vídeo: {entrada}")
+
+    fps = captura.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 25.0
+
+    escritor = None
+
+    while True:
+        sucesso, quadro = captura.read()
+        if not sucesso:
+            break
+
+        resultado = processar_quadro(quadro)
+
+        if escritor is None:
+            altura, largura = resultado.shape[:2]
+            codec = cv2.VideoWriter_fourcc(*"mp4v")
+            escritor = cv2.VideoWriter(
+                str(saida), codec, fps, (largura, altura)
+            )
+
+        escritor.write(resultado)
+
+    captura.release()
+
+    if escritor is not None:
+        escritor.release()
+
+    print(f"Vídeo processado e salvo em: {saida}")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Treina ou executa reconhecimento facial com LBPH."
+    )
+    parser.add_argument("--treinar", action="store_true")
+    parser.add_argument("--dados", type=Path, default=Path("pessoas"))
+    parser.add_argument("--entrada", type=Path)
+    parser.add_argument("--saida", type=Path, default=Path("resultado.mp4"))
+    parser.add_argument("--modelo", type=Path, default=Path("modelo_lbph.yml"))
+    parser.add_argument("--nomes", type=Path, default=Path("nomes.json"))
+    parser.add_argument(
+        "--limite",
+        type=float,
+        default=80.0,
+        help="Distância máxima inicial para aceitar uma identificação.",
+    )
+    args = parser.parse_args()
+
+    if not hasattr(cv2, "face"):
+        raise RuntimeError(
+            "O módulo cv2.face não está disponível. "
+            "Instale opencv-contrib-python."
+        )
+
+    if args.treinar:
+        treinar(args.dados, args.modelo, args.nomes)
+    else:
+        if args.entrada is None:
+            parser.error("Informe --entrada para reconhecer uma imagem ou vídeo.")
+
+        reconhecer(
+            args.entrada,
+            args.saida,
+            args.modelo,
+            args.nomes,
+            args.limite,
+        )
+
+
+if __name__ == "__main__":
+    main()
